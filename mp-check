@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+
+"""
+A quick-and-dirty MacPorts check tool for port maintainers.
+
+Checks are:
+
+    - Livecheck: a `port livecheck` of the maintainer's ports.
+
+    - Tickets: the opened Trac tickets for the maintainer's ports.
+
+The `~/.macports/mp-check.conf` config file contains the maintainer's name as
+well as ports to add or to exclude from the checks.
+
+The Livecheck `exclude-subports` also allow to exclude subports from the checks.
+"""
+
+# FIXME implement exclude-ports support in Tickets
+# TODO package the script
+# TODO document config file format
+
+import argparse
+import configparser
+import logging
+import logging.config
+import sys
+from itertools import chain
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Set
+
+import pandas as pd
+from multidict import MultiDict
+from sh import port
+from yarl import URL
+
+CONFIG_FILENAMES = (
+    "mp-check.conf",
+    Path("~/.macports/mp-check.conf").expanduser(),
+)
+LOGGING_CONFIG = {
+    "version": 1,
+    "formatters": {"brief": {"format": "%(levelname)s: %(message)s"}},
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "brief",
+            "stream": "ext://sys.stdout",
+        }
+    },
+    "loggers": {__name__: {"handlers": ["console"]}},
+}
+EXCLUDE_SUBPORTS = True
+
+logging.config.dictConfig(LOGGING_CONFIG)
+log = logging.getLogger(__name__)
+
+port = port.bake("-q")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Check MacPorts port maintainer information."
+    )
+    verbosity = parser.add_mutually_exclusive_group()
+    verbosity.add_argument(
+        "-v", "--verbose", nargs="?", dest="loglevel", const=logging.INFO
+    )
+    verbosity.add_argument(
+        "-d", "--debug", nargs="?", dest="loglevel", const=logging.DEBUG
+    )
+    return parser.parse_args()
+
+
+def parse_config(
+    filenames: List[str], defaults: Dict = None
+) -> configparser.ConfigParser:
+    def getlist(option, sep=",", chars=None):
+        """Return a list from a ConfigParser option. By default,
+           split on a comma and strip whitespaces."""
+        return [chunk.strip(chars) for chunk in option.split(sep)]
+
+    def optionxform(option):
+        """Convert the option name to lowercase and replace dashes to
+           underscores."""
+        return option.lower().replace("-", "_")
+
+    config = configparser.ConfigParser(
+        converters={"list": getlist}, defaults=defaults
+    )
+    config.optionxform = optionxform  # type: ignore
+
+    config.read(filenames)
+    return config
+
+
+class _Base:
+    def __init__(self, options):
+        log.info("%s: options are %s", self, dict(options))
+        self.options = options
+        self.maintainer = options.get("maintainer")
+        self.include_ports = options.getlist("include_ports", [])
+        self.exclude_ports = options.getlist("exclude_ports", [])
+
+    def __str__(self):
+        return self.__class__.__name__
+
+    def check(self) -> Any:
+        raise NotImplementedError()
+
+
+class Livecheck(_Base):
+    """Livecheck maintainer's ports."""
+
+    def __init__(self, options):
+        super().__init__(options)
+        self.exclude_subports = options.getboolean(
+            "exclude_subports", EXCLUDE_SUBPORTS
+        )
+
+    def port_filters(self):
+        exclude_ports = "".join(
+            f" and not name:{p}" for p in self.exclude_ports
+        )
+        filters = [f"maintainer:{self.maintainer}{exclude_ports}"]
+        filters.extend(f"name:{p}" for p in self.include_ports)
+        return filters
+
+    def ports(self, filters: Iterable[str]) -> Set[str]:
+        """List the ports matching the port filters"""
+        ports = set(
+            chain.from_iterable(
+                port.echo(f).split() for f in self.port_filters()
+            )
+        )
+        return ports
+
+    def subports(self, ports: Iterable[str]) -> Set[str]:
+        """List the subports of given ports"""
+        subports = set(
+            chain.from_iterable(
+                sp.strip().split(", ")
+                for sp in port.info("--subports", *ports).split("--")
+            )
+        )
+        return subports
+
+    def check(self) -> str:
+        filters = self.port_filters()
+        log.info("%s: port filters are %s", self, filters)
+        ports = self.ports(filters)
+        log.debug("%s: found ports %s", self, ports)
+        if self.exclude_subports:
+            subports = self.subports(ports)
+            log.debug("%s: excluding subports %s", self, subports)
+            ports = ports - subports
+        log.info("%s: livechecking ports", self)
+        livechecks = port.bake("-v").livecheck(sorted(ports))
+        return livechecks
+
+
+class Tickets(_Base):
+    """Get Trac open tickets for maintainer's ports."""
+
+    trac_query_url = URL("https://trac.macports.org/query")
+    default_trac_criteria = (
+        ("status", "accepted"),
+        ("status", "assigned"),
+        ("status", "new"),
+        ("status", "reopened"),
+    )
+    trac_cols = ("id", "port", "summary", "status", "type")
+    trac_order = "port"
+    trac_format = "tab"
+
+    def trac_filters(self):
+        filters = [{"owner": self.maintainer}]
+        for p in self.include_ports:
+            filters.append({"port": f"~{p}"})
+        return filters
+
+    def trac_query(self) -> MultiDict:
+        """Make a MultiDict-based Trac query"""
+        query: MultiDict = MultiDict()
+        for f in self.trac_filters():
+            criteria = MultiDict(Tickets.default_trac_criteria)
+            criteria.extend(f)
+            if query:
+                query.add("or", "")
+            query.extend(criteria)
+        query.extend(("col", c) for c in Tickets.trac_cols)
+        query.add("order", Tickets.trac_order)
+        query.add("format", Tickets.trac_format)
+        return query
+
+    def check(self) -> pd.DataFrame:
+        """Query MacPorts Trac tickets based on given filters."""
+        query = self.trac_query()
+        log.debug("%s: Trac query is %s", self, query)
+        url = Tickets.trac_query_url.with_query(query)
+        log.debug("%s: Trac query url is %s", self, url)
+        log.info("%s: querying Trac", self)
+        tickets = pd.read_csv(str(url), delimiter="\t", index_col=0)
+        return tickets
+
+
+def main():
+    args = parse_args()
+    config = parse_config(CONFIG_FILENAMES)
+
+    log.setLevel(args.loglevel or logging.WARN)
+    log.info("args are %s", args)
+
+    for cls in (Livecheck, Tickets):
+        check = cls(config[cls.__name__])
+        print("---> {}\n{}".format(cls.__name__, check.check()))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+# vim: tabstop=8 expandtab shiftwidth=4 softtabstop=4

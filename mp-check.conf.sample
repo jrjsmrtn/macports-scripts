@@ -1,0 +1,18 @@
+[DEFAULT]
+maintainer: jrjsmrtn
+include-ports: 
+    postgresql-jdbc
+#exclude-ports:
+
+[Livecheck]
+exclude-subports: true
+#include-ports:
+#exclude-ports:
+#    py-zmq
+
+[Tickets]
+include-ports: 
+    postgresql11, postgresql11-server,
+    postgresql12, postgresql12-server,
+    python38
+#exclude-ports: py-zmq
