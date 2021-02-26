@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+
+"""
+Fix Xcode Command Line Tools installation for MacPorts, according to:
+    https://trac.macports.org/wiki/ProblemHotlist#reinstall-clt
+
+Download the command line tools package from the Apple Developer site.
+
+If the version of the CLT you need is not listed at the developer site, but
+an older version is, reinstalling that will restore the package receipts. Then i
+just run Software Update to trigger the update to the newer version.
+
+Or, on Mac OS X 10.9 or greater, Software Update can reinstall the package:
+
+- `sudo touch /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress`
+- `softwareupdate -l`
+- Run Software Update
+- `sudo rm /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress`
+"""
+
+import re
+import sys
+from contextlib import contextmanager
+from pathlib import Path
+
+from sh import softwareupdate
+softwareupdate = softwareupdate.bake(_err_to_out=True)
+
+
+CLT_IOD_PATH = Path("/tmp/.com.apple.dt.CommandLineTools"
+                    ".installondemand.in-progress")
+FOUND = "Software Update found the following new or updated software:"
+NOT_FOUND = "No new software available."
+RECORD_RE = re.compile(r"^\*\s+(.+(?:\n\s+.+)+)$", re.MULTILINE)
+ITEM_RE = re.compile(r"\s*(?P<key>\w+):\s+(?P<value>[^,\n]+)", re.MULTILINE)
+CLT_TITLE = "Command Line Tools for Xcode"
+
+
+@contextmanager
+def clt_installondemand():
+    """Trigger the Command Line Tools for Xcode Install on Demand."""
+    CLT_IOD_PATH.touch()
+    try:
+        yield
+    finally:
+        CLT_IOD_PATH.unlink()
+
+def parse_su_list(sulist):
+    """Parse the `softwareupdate --list` result."""
+    for record in RECORD_RE.findall(sulist):
+        yield dict(ITEM_RE.findall(record))
+
+
+def main():
+    with clt_installondemand():
+        result = softwareupdate("--list").stdout.decode(sys.stdin.encoding)
+        if FOUND in result:
+            clt_label = next(swupdate.get("Label")
+                             for swupdate in parse_su_list(result)
+                             if swupdate["Title"] == CLT_TITLE)
+            print(clt_label)
+            result = softwareupdate("--install", clt_label).stdout.decode(sys.stdin.encoding)
+            print(result)
+
+
+if __name__ == "__main__":
+    main()
