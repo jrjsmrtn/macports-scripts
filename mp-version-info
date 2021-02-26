@@ -1,0 +1,5 @@
+#!/bin/bash
+
+echo "MacPorts $(port -q version)"
+echo "macOS $(sw_vers -productVersion) $(sw_vers -buildVersion)"
+echo "Xcode $(xcodebuild -version | awk -v ORS=' ' '{print $NF}')"
