@@ -7,7 +7,7 @@ Fix Xcode Command Line Tools installation for MacPorts, according to:
 Download the command line tools package from the Apple Developer site.
 
 If the version of the CLT you need is not listed at the developer site, but
-an older version is, reinstalling that will restore the package receipts. Then i
+an older version is, reinstalling that will restore the package receipts. Then
 just run Software Update to trigger the update to the newer version.
 
 Or, on Mac OS X 10.9 or greater, Software Update can reinstall the package:
@@ -45,22 +45,38 @@ def clt_installondemand():
     finally:
         CLT_IOD_PATH.unlink()
 
-def parse_su_list(sulist):
+
+def parse_swupdate_list(sulist):
     """Parse the `softwareupdate --list` result."""
     for record in RECORD_RE.findall(sulist):
         yield dict(ITEM_RE.findall(record))
 
 
 def main():
+    # Trigger CLT Install on Demand
     with clt_installondemand():
-        result = softwareupdate("--list").stdout.decode(sys.stdin.encoding)
+        # Check for software updates
+        result = (softwareupdate("--list")
+                  .stdout.decode(sys.stdin.encoding))
+
         if FOUND in result:
-            clt_label = next(swupdate.get("Label")
-                             for swupdate in parse_su_list(result)
-                             if swupdate["Title"] == CLT_TITLE)
-            print(clt_label)
-            result = softwareupdate("--install", clt_label).stdout.decode(sys.stdin.encoding)
-            print(result)
+            clt_labels = list(swupdate.get("Label")
+                              for swupdate in parse_swupdate_list(result)
+                              if swupdate["Title"] == CLT_TITLE)
+            if (not clt_labels):
+                raise Exception("Found no software updates "
+                                f"for {CLT_TITLE}")
+            elif (len(clt_labels) > 1):
+                raise Exception("Found multiple software updates "
+                                f"for {CLT_TITLE}: {clt_labels}")
+            else:
+                # Install CLT
+                print(f"Found software update: {clt_labels[0]}.")
+                result = (softwareupdate("--install", clt_labels[0])
+                          .stdout.decode(sys.stdin.encoding))
+                print(result)
+        else:
+            raise Exception(f"Found no software updates: {result}")
 
 
 if __name__ == "__main__":
