@@ -9,10 +9,15 @@ Checks are:
 
     - Tickets: the opened Trac tickets for the maintainer's ports.
 
+    - PullRequests: the opened Pull Requests for the
+
+    - Lint: the opened Trac tickets for the maintainer's ports.
+
 The `~/.macports/mp-check.conf` config file contains the maintainer's name as
 well as ports to add or to exclude from the checks.
 
-The Livecheck `exclude-subports` also allow to exclude subports from the checks.
+The Livecheck `exclude-subports` also allow to exclude subports from the
+checks.
 """
 
 # FIXME implement exclude-ports support in Tickets
@@ -23,23 +28,46 @@ import argparse
 import configparser
 import logging
 import logging.config
+import re
 import sys
+from abc import ABC, abstractmethod
+from functools import partial
 from itertools import chain
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Set
+from typing import (
+    Any,
+    ClassVar,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Union,
+)
 
 import pandas as pd
+from github import Github
 from multidict import MultiDict
 from sh import port
 from yarl import URL
 
-CONFIG_FILENAMES = (
+ConfigParserDefaultsType = Optional[Dict[str, str]]
+DictConfigType = Dict[str, Any]
+FilenameType = Union[str, Path]
+FilenamesType = Sequence[FilenameType]
+
+CHECKS = ("Livecheck", "Tickets", "PullRequests", "Lint")
+CONFIG_FILENAMES: FilenamesType = [Path(p).expanduser() for p in (
     "mp-check.conf",
-    Path("~/.macports/mp-check.conf").expanduser(),
-)
-LOGGING_CONFIG = {
+    "~/.macports/mp-check.conf",
+)]
+LOGGING_CONFIG: DictConfigType = {
     "version": 1,
-    "formatters": {"brief": {"format": "%(levelname)s: %(message)s"}},
+    "formatters": {
+        # "brief": {"format": "%(levelname)s: %(message)s"},
+        "brief": {"format": "%(message)s"},
+    },
     "handlers": {
         "console": {
             "class": "logging.StreamHandler",
@@ -49,7 +77,6 @@ LOGGING_CONFIG = {
     },
     "loggers": {__name__: {"handlers": ["console"]}},
 }
-EXCLUDE_SUBPORTS = True
 
 logging.config.dictConfig(LOGGING_CONFIG)
 log = logging.getLogger(__name__)
@@ -57,35 +84,61 @@ log = logging.getLogger(__name__)
 port = port.bake("-q")
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments."""
     parser = argparse.ArgumentParser(
         description="Check MacPorts port maintainer information."
     )
+    check_group = parser.add_argument_group("checks")
+    for check in CHECKS:
+        check_group.add_argument(
+            "--" + check.lower(),
+            action="append_const",
+            dest="checks",
+            const=check,
+        )
     verbosity = parser.add_mutually_exclusive_group()
     verbosity.add_argument(
-        "-v", "--verbose", nargs="?", dest="loglevel", const=logging.INFO
+        "-v",
+        "--verbose",
+        action="store_const",
+        dest="loglevel",
+        const=logging.INFO,
+        default=logging.WARN,
     )
     verbosity.add_argument(
-        "-d", "--debug", nargs="?", dest="loglevel", const=logging.DEBUG
+        "-d",
+        "--debug",
+        action="store_const",
+        dest="loglevel",
+        const=logging.DEBUG,
     )
     return parser.parse_args()
 
 
 def parse_config(
-    filenames: List[str], defaults: Dict = None
+    filenames: FilenamesType, defaults: ConfigParserDefaultsType = None
 ) -> configparser.ConfigParser:
-    def getlist(option, sep=",", chars=None):
+    """Parse config files."""
+
+    def getlist(
+        option: str, sep: Optional[str] = ",", chars: Optional[str] = None
+    ) -> List[str]:
         """Return a list from a ConfigParser option. By default,
            split on a comma and strip whitespaces."""
-        return [chunk.strip(chars) for chunk in option.split(sep)]
+        # return [chunk.strip(chars) for chunk in option.split(sep)]
+        values = [chunk.strip(chars)
+                  for chunk in re.compile(sep).split(option)]
+        return [v for v in values if v]
 
-    def optionxform(option):
-        """Convert the option name to lowercase and replace dashes to
-           underscores."""
+    def optionxform(option: str) -> str:
+        """Convert a ConfigParser option name to lowercase and replace dashes
+           with underscores."""
         return option.lower().replace("-", "_")
 
     config = configparser.ConfigParser(
-        converters={"list": getlist}, defaults=defaults
+        converters={"list": partial(getlist, sep=r"[,\s\n]+")},
+        defaults=defaults
     )
     config.optionxform = optionxform  # type: ignore
 
@@ -93,31 +146,25 @@ def parse_config(
     return config
 
 
-class _Base:
-    def __init__(self, options):
-        log.info("%s: options are %s", self, dict(options))
+class _Base(ABC):
+    """An abstract base class for MacPorts checks"""
+
+    def __init__(self, options: configparser.SectionProxy) -> None:
+        log.debug("%s: options are %s", self, dict(options))
         self.options = options
-        self.maintainer = options.get("maintainer")
-        self.include_ports = options.getlist("include_ports", [])
-        self.exclude_ports = options.getlist("exclude_ports", [])
+        self.maintainer: str = options.get("maintainer")
+        self.include_ports: Set[str] = set(
+            options.getlist("include_ports", [])
+        )
+        self.exclude_ports: Set[str] = set(
+            options.getlist("exclude_ports", [])
+        )
 
     def __str__(self):
         return self.__class__.__name__
 
-    def check(self) -> Any:
-        raise NotImplementedError()
-
-
-class Livecheck(_Base):
-    """Livecheck maintainer's ports."""
-
-    def __init__(self, options):
-        super().__init__(options)
-        self.exclude_subports = options.getboolean(
-            "exclude_subports", EXCLUDE_SUBPORTS
-        )
-
-    def port_filters(self):
+    def port_filters(self) -> List[str]:
+        """Make a list of port filters."""
         exclude_ports = "".join(
             f" and not name:{p}" for p in self.exclude_ports
         )
@@ -126,7 +173,7 @@ class Livecheck(_Base):
         return filters
 
     def ports(self, filters: Iterable[str]) -> Set[str]:
-        """List the ports matching the port filters"""
+        """List the ports matching the given filters."""
         ports = set(
             chain.from_iterable(
                 port.echo(f).split() for f in self.port_filters()
@@ -135,7 +182,7 @@ class Livecheck(_Base):
         return ports
 
     def subports(self, ports: Iterable[str]) -> Set[str]:
-        """List the subports of given ports"""
+        """List the subports of given ports."""
         subports = set(
             chain.from_iterable(
                 sp.strip().split(", ")
@@ -144,75 +191,189 @@ class Livecheck(_Base):
         )
         return subports
 
+    @abstractmethod
+    def check(self) -> Any:
+        raise NotImplementedError()
+
+
+class Lint(_Base):
+    """Lint maintainer's ports."""
+
+    EXCLUDE_SUBPORTS: ClassVar[bool] = True
+
+    def __init__(self, options: configparser.SectionProxy) -> None:
+        super().__init__(options)
+        self.exclude_subports: bool = options.getboolean(
+            "exclude_subports", fallback=Lint.EXCLUDE_SUBPORTS
+        )
+
     def check(self) -> str:
+        log.warning("---> %s", self)
         filters = self.port_filters()
-        log.info("%s: port filters are %s", self, filters)
+        log.debug("%s: port filters are %s", self, filters)
+
         ports = self.ports(filters)
         log.debug("%s: found ports %s", self, ports)
         if self.exclude_subports:
             subports = self.subports(ports)
             log.debug("%s: excluding subports %s", self, subports)
             ports = ports - subports
-        log.info("%s: livechecking ports", self)
-        livechecks = port.bake("-v").livecheck(sorted(ports))
-        return livechecks
+
+        NOTOK_RE = re.compile(r"^(?!OK:\s+).+$", re.MULTILINE)
+        for p in sorted(ports):
+            lint = port.bake("-v").lint(p).stdout.decode(sys.stdin.encoding)
+            if log.isEnabledFor(logging.INFO):
+                log.info(lint)
+            else:
+                notok = NOTOK_RE.findall(lint)
+                if notok:
+                    log.warning("\n".join(notok))
+
+
+class Livecheck(_Base):
+    """Livecheck maintainer's ports."""
+
+    EXCLUDE_SUBPORTS: ClassVar[bool] = True
+
+    def __init__(self, options: configparser.SectionProxy) -> None:
+        super().__init__(options)
+        self.exclude_subports: bool = options.getboolean(
+            "exclude_subports", fallback=Livecheck.EXCLUDE_SUBPORTS
+        )
+
+    def check(self) -> str:
+        log.warning("---> %s", self)
+        filters = self.port_filters()
+        log.debug("%s: port filters are %s", self, filters)
+        ports = self.ports(filters)
+        log.debug("%s: found ports %s", self, ports)
+        if self.exclude_subports:
+            subports = self.subports(ports)
+            log.debug("%s: excluding subports %s", self, subports)
+            ports = ports - subports
+        log.debug("%s: livechecking ports", self)
+        livechecks = port.bake("-v").livecheck(sorted(ports)).stdout.decode(
+            sys.stdin.encoding)
+        if log.isEnabledFor(logging.INFO):
+            log.info(livechecks)
+        else:
+            UPDATED_RE = re.compile(
+                r"^.+seems to have been updated.+$",
+                re.MULTILINE)
+            updated = UPDATED_RE.findall(livechecks)
+            if updated:
+                for update in updated:
+                    log.warning(update)
+
+
+class PullRequests(_Base):
+    """Check MacPorts Pull Requests."""
+
+    EXCLUDE_SUBPORTS: ClassVar[bool] = True
+
+    def __init__(self, options: configparser.SectionProxy) -> None:
+        super().__init__(options)
+        self.exclude_subports: bool = options.getboolean(
+            "exclude_subports", fallback=Livecheck.EXCLUDE_SUBPORTS
+        )
+        gh = Github()
+        self.repo = gh.get_repo("macports/macports-ports")
+
+    def check(self) -> str:
+        log.warning("---> %s", self)
+        filters = self.port_filters()
+        log.debug("%s: port filters are %s", self, filters)
+        ports = self.ports(filters)
+        log.debug("%s: found ports %s", self, ports)
+        if self.exclude_subports:
+            subports = self.subports(ports)
+            log.debug("%s: excluding subports %s", self, subports)
+            ports = ports - subports
+        log.debug("%s: getting pull requests", self)
+
+        SEP_RE = re.compile(r":\s")
+        COLS = ("number", "title", "user.login", "labels")
+
+        def getter(port):
+            return (port.number, port.title, port.user.login,
+                    ", ".join(label.name for label in port.get_labels()))
+
+        pulls = pd.DataFrame.from_records(
+            (getter(p) for p in self.repo.get_pulls(state="open")
+             if (p.user.login == self.maintainer)
+             or (set(SEP_RE.split(p.title)[0].split()) & ports)),
+            columns=COLS, index=COLS[0])
+        log.warning(pulls)
 
 
 class Tickets(_Base):
     """Get Trac open tickets for maintainer's ports."""
 
-    trac_query_url = URL("https://trac.macports.org/query")
-    default_trac_criteria = (
-        ("status", "accepted"),
-        ("status", "assigned"),
-        ("status", "new"),
-        ("status", "reopened"),
+    TRAC_QUERY_URL: ClassVar[URL] = URL("https://trac.macports.org/query")
+    DEFAULT_TRAC_CRITERIA: ClassVar[MultiDict] = MultiDict(
+        (
+            ("status", "accepted"),
+            ("status", "assigned"),
+            ("status", "new"),
+            ("status", "reopened"),
+        )
     )
-    trac_cols = ("id", "port", "summary", "status", "type")
-    trac_order = "port"
-    trac_format = "tab"
+    TRAC_COLS: ClassVar[Iterable[str]] = (
+        "id",
+        "port",
+        "summary",
+        "status",
+        "type",
+    )
+    TRAC_ORDER: ClassVar[str] = "port"
+    TRAC_FORMAT: ClassVar[str] = "tab"
 
-    def trac_filters(self):
+    def trac_filters(self) -> List[Dict[str, str]]:
+        """Make a list of Trac filters."""
         filters = [{"owner": self.maintainer}]
         for p in self.include_ports:
             filters.append({"port": f"~{p}"})
         return filters
 
     def trac_query(self) -> MultiDict:
-        """Make a MultiDict-based Trac query"""
+        """Make a MultiDict-based Trac query."""
         query: MultiDict = MultiDict()
         for f in self.trac_filters():
-            criteria = MultiDict(Tickets.default_trac_criteria)
+            criteria = Tickets.DEFAULT_TRAC_CRITERIA.copy()
             criteria.extend(f)
             if query:
                 query.add("or", "")
             query.extend(criteria)
-        query.extend(("col", c) for c in Tickets.trac_cols)
-        query.add("order", Tickets.trac_order)
-        query.add("format", Tickets.trac_format)
+        query.extend(("col", c) for c in Tickets.TRAC_COLS)
+        query.add("order", Tickets.TRAC_ORDER)
+        query.add("format", Tickets.TRAC_FORMAT)
         return query
 
     def check(self) -> pd.DataFrame:
         """Query MacPorts Trac tickets based on given filters."""
+        log.warning("---> %s", self)
         query = self.trac_query()
         log.debug("%s: Trac query is %s", self, query)
-        url = Tickets.trac_query_url.with_query(query)
+        url = Tickets.TRAC_QUERY_URL.with_query(query)
         log.debug("%s: Trac query url is %s", self, url)
-        log.info("%s: querying Trac", self)
+        log.debug("%s: querying Trac", self)
         tickets = pd.read_csv(str(url), delimiter="\t", index_col=0)
-        return tickets
+        if not tickets.empty:
+            log.warning(tickets)
+        else:
+            log.info("Found no relevant Trac tickets.")
 
 
 def main():
     args = parse_args()
+    log.setLevel(args.loglevel or logging.WARN)
+    log.debug("args are %s", args)
+
+    log.debug("reading config from %s", CONFIG_FILENAMES)
     config = parse_config(CONFIG_FILENAMES)
 
-    log.setLevel(args.loglevel or logging.WARN)
-    log.info("args are %s", args)
-
-    for cls in (Livecheck, Tickets):
-        check = cls(config[cls.__name__])
-        print("---> {}\n{}".format(cls.__name__, check.check()))
+    for cls in (Livecheck, Tickets, PullRequests, Lint):
+        cls(config[cls.__name__]).check()
 
 
 if __name__ == "__main__":
