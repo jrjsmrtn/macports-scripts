@@ -37,13 +37,9 @@ from pathlib import Path
 from typing import (
     Any,
     ClassVar,
-    Dict,
     Iterable,
-    List,
     Optional,
     Sequence,
-    Set,
-    Union,
 )
 
 import pandas as pd
@@ -52,16 +48,19 @@ from multidict import MultiDict
 from sh import port
 from yarl import URL
 
-ConfigParserDefaultsType = Optional[Dict[str, str]]
-DictConfigType = Dict[str, Any]
-FilenameType = Union[str, Path]
+ConfigParserDefaultsType = Optional[dict[str, str]]
+DictConfigType = dict[str, Any]
+FilenameType = str | Path
 FilenamesType = Sequence[FilenameType]
 
 CHECKS = ("Livecheck", "Tickets", "PullRequests", "Lint")
-CONFIG_FILENAMES: FilenamesType = [Path(p).expanduser() for p in (
-    "mp-check.conf",
-    "~/.macports/mp-check.conf",
-)]
+CONFIG_FILENAMES: FilenamesType = [
+    Path(p).expanduser()
+    for p in (
+        "mp-check.conf",
+        "~/.macports/mp-check.conf",
+    )
+]
 LOGGING_CONFIG: DictConfigType = {
     "version": 1,
     "formatters": {
@@ -123,22 +122,23 @@ def parse_config(
 
     def getlist(
         option: str, sep: Optional[str] = ",", chars: Optional[str] = None
-    ) -> List[str]:
+    ) -> list[str]:
         """Return a list from a ConfigParser option. By default,
-           split on a comma and strip whitespaces."""
+        split on a comma and strip whitespaces."""
         # return [chunk.strip(chars) for chunk in option.split(sep)]
-        values = [chunk.strip(chars)
-                  for chunk in re.compile(sep).split(option)]
+        values = [
+            chunk.strip(chars) for chunk in re.compile(sep).split(option)
+        ]
         return [v for v in values if v]
 
     def optionxform(option: str) -> str:
         """Convert a ConfigParser option name to lowercase and replace dashes
-           with underscores."""
+        with underscores."""
         return option.lower().replace("-", "_")
 
     config = configparser.ConfigParser(
         converters={"list": partial(getlist, sep=r"[,\s\n]+")},
-        defaults=defaults
+        defaults=defaults,
     )
     config.optionxform = optionxform  # type: ignore
 
@@ -153,17 +153,17 @@ class _Base(ABC):
         log.debug("%s: options are %s", self, dict(options))
         self.options = options
         self.maintainer: str = options.get("maintainer")
-        self.include_ports: Set[str] = set(
+        self.include_ports: set[str] = set(
             options.getlist("include_ports", [])
         )
-        self.exclude_ports: Set[str] = set(
+        self.exclude_ports: set[str] = set(
             options.getlist("exclude_ports", [])
         )
 
     def __str__(self):
         return self.__class__.__name__
 
-    def port_filters(self) -> List[str]:
+    def port_filters(self) -> list[str]:
         """Make a list of port filters."""
         exclude_ports = "".join(
             f" and not name:{p}" for p in self.exclude_ports
@@ -172,7 +172,7 @@ class _Base(ABC):
         filters.extend(f"name:{p}" for p in self.include_ports)
         return filters
 
-    def ports(self, filters: Iterable[str]) -> Set[str]:
+    def ports(self, filters: Iterable[str]) -> set[str]:
         """List the ports matching the given filters."""
         ports = set(
             chain.from_iterable(
@@ -181,7 +181,7 @@ class _Base(ABC):
         )
         return ports
 
-    def subports(self, ports: Iterable[str]) -> Set[str]:
+    def subports(self, ports: Iterable[str]) -> set[str]:
         """List the subports of given ports."""
         subports = set(
             chain.from_iterable(
@@ -252,14 +252,17 @@ class Livecheck(_Base):
             log.debug("%s: excluding subports %s", self, subports)
             ports = ports - subports
         log.debug("%s: livechecking ports", self)
-        livechecks = port.bake("-v").livecheck(sorted(ports)).stdout.decode(
-            sys.stdin.encoding)
+        livechecks = (
+            port.bake("-v")
+            .livecheck(sorted(ports))
+            .stdout.decode(sys.stdin.encoding)
+        )
         if log.isEnabledFor(logging.INFO):
             log.info(livechecks)
         else:
             UPDATED_RE = re.compile(
-                r"^.+seems to have been updated.+$",
-                re.MULTILINE)
+                r"^.+seems to have been updated.+$", re.MULTILINE
+            )
             updated = UPDATED_RE.findall(livechecks)
             if updated:
                 for update in updated:
@@ -295,14 +298,23 @@ class PullRequests(_Base):
         COLS = ("number", "title", "user.login", "labels")
 
         def getter(port):
-            return (port.number, port.title, port.user.login,
-                    ", ".join(label.name for label in port.get_labels()))
+            return (
+                port.number,
+                port.title,
+                port.user.login,
+                ", ".join(label.name for label in port.get_labels()),
+            )
 
         pulls = pd.DataFrame.from_records(
-            (getter(p) for p in self.repo.get_pulls(state="open")
-             if (p.user.login == self.maintainer)
-             or (set(SEP_RE.split(p.title)[0].split()) & ports)),
-            columns=COLS, index=COLS[0])
+            (
+                getter(p)
+                for p in self.repo.get_pulls(state="open")
+                if (p.user.login == self.maintainer)
+                or (set(SEP_RE.split(p.title)[0].split()) & ports)
+            ),
+            columns=COLS,
+            index=COLS[0],
+        )
         log.warning(pulls)
 
 
@@ -328,7 +340,7 @@ class Tickets(_Base):
     TRAC_ORDER: ClassVar[str] = "port"
     TRAC_FORMAT: ClassVar[str] = "tab"
 
-    def trac_filters(self) -> List[Dict[str, str]]:
+    def trac_filters(self) -> list[dict[str, str]]:
         """Make a list of Trac filters."""
         filters = [{"owner": self.maintainer}]
         for p in self.include_ports:
