@@ -2,12 +2,15 @@
 
 """Parse crago.crates from a Portfile."""
 
+import argparse
 import re
 import sys
+from pathlib import Path
 from typing import ClassVar
 
 # from pprint import pprint as print
 from parsimonious import Grammar, NodeVisitor  # type: ignore[import]
+from parsimonious.exceptions import ParseError  # type: ignore[import]
 from yaml import dump  # type: ignore[import]
 
 CURRENT: str = r"""checksums           ${distname}${extract.suffix}  \
@@ -460,7 +463,9 @@ grammar = Grammar(
     r"""
     checksums = 'checksums' _ pchecksum+
     pchecksum = fname _ fchecksum+ _ fsize _
-    fname = ~r'[\w\.\+-]+'
+    # Portfiles write the distfile as a Tcl expansion, e.g.
+    # ${distname}${extract.suffix}, so $ { } are part of a filename here.
+    fname = ~r'[\w\.\+\-\$\{\}]+'
     fchecksum = type _ checksum _
     type = ('rmd160' / 'sha256')
     checksum = ~'[0-9A-Za-z]+'
@@ -598,8 +603,54 @@ class GroupedChecksumsVisitor(ChecksumsVisitor):
             self.files[fname] = props
 
 
+
+def extract_block(text: str, keyword: str = "checksums") -> str:
+    """Return a Portfile's `keyword` block, following backslash continuations.
+
+    A Portfile is Tcl, not something this grammar parses; only the one block is.
+    """
+    lines = text.splitlines()
+    for start, line in enumerate(lines):
+        if re.match(rf"^{re.escape(keyword)}\b", line):
+            block = [line]
+            while block[-1].rstrip().endswith("\\") and start + len(block) < len(lines):
+                block.append(lines[start + len(block)])
+            return "\n".join(block)
+    raise SystemExit(f"no {keyword} block found")
+
+
+def make_argparser() -> argparse.ArgumentParser:
+    """Build the argument parser."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "portfile",
+        nargs="?",
+        type=Path,
+        help="Portfile to convert; reads stdin when omitted",
+    )
+    return parser
+
+
 if __name__ == "__main__":
-    grouped = GroupedChecksumsVisitor().visit(grammar.parse(NEW))
+    args = make_argparser().parse_args()
+    source = args.portfile.read_text() if args.portfile else sys.stdin.read()
+
+    block = extract_block(source)
+    try:
+        tree = grammar.parse(block)
+    except ParseError as exc:
+        # The common case is a single-distfile block, where MacPorts allows the
+        # filename to be omitted and this grammar requires it. Such a block has
+        # no crates to convert, so report it rather than raising a traceback.
+        raise SystemExit(
+            f"could not parse the checksums block: {exc}\n"
+            "note: a block that names no distfile has no .crate entries to convert"
+        ) from exc
+
+    grouped = GroupedChecksumsVisitor().visit(tree)
+
+    if not grouped["crates"]:
+        raise SystemExit("no .crate entries in the checksums block; nothing to convert")
 
     block = format_crates(grouped["crates"])
 
