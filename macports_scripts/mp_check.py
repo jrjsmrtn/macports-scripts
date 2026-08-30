@@ -143,7 +143,7 @@ class Lint(Monitor):
             ports = ports - subports
 
         for p in sorted(ports):
-            lint = port.bake("-v").lint(p).stdout.decode(sys.stdin.encoding)
+            lint = port.bake("-v").lint(p)
             if log.isEnabledFor(logging.INFO):
                 log.info(lint)
             else:
@@ -176,7 +176,7 @@ class Livecheck(Monitor):
             ports = ports - subports
         log.debug("%s: livechecking ports", self)
         livechecks = (
-            port.bake("-v").livecheck(sorted(ports)).stdout.decode(sys.stdin.encoding)
+            port.bake("-v").livecheck(sorted(ports))
         )
         if log.isEnabledFor(logging.INFO):
             log.info(livechecks)

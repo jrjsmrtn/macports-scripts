@@ -3,15 +3,27 @@
 
 The implementation lives in macports_scripts/mp_check.py, which pyproject.toml
 installs as the `mp-check` console script. This wrapper exists so the `mp`
-dispatcher keeps working without `poetry install`, and so there is only one copy
-of the code: the two diverged for three commits and the standalone copy carried
-a bug the packaged one did not.
+dispatcher keeps working without an activated environment, and so there is only
+one copy of the code: the two diverged for three commits and the standalone copy
+carried a bug the packaged one did not.
+
+The dependencies are not in the system interpreter, so if we are running outside
+a virtualenv and the project has one, re-exec under it. `uv sync` creates it.
 """
 
+import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+_HERE = Path(__file__).resolve().parent
+_VENV_PYTHON = _HERE / ".venv" / "bin" / "python"
+
+if sys.prefix == sys.base_prefix and _VENV_PYTHON.exists():
+    # Not in a virtualenv, but the project has one: hand over to it. The guard
+    # above is what stops this re-exec'ing forever.
+    os.execv(str(_VENV_PYTHON), [str(_VENV_PYTHON), str(Path(__file__).resolve()), *sys.argv[1:]])
+
+sys.path.insert(0, str(_HERE))
 
 from macports_scripts.mp_check import main  # noqa: E402
 
