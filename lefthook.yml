@@ -1,0 +1,84 @@
+# QA baseline for macports-scripts.
+#
+# Replaces .pre-commit-config.yaml, which pinned prospector 1.7.7 and could no
+# longer install: its transitive pylint-celery==0.3 has no wheel for Python 3.14,
+# so *every* commit in this repo was blocked by an environment failure rather
+# than by a finding. That config was also untracked, so a fresh clone reproduced
+# neither the gate nor its breakage. This file is tracked.
+#
+# ruff replaces prospector's pyflakes/pycodestyle/pydocstyle/pylint subset AND
+# bandit (its S rules), so one tool covers what three did.
+#
+# INSTALL (once per clone — hooks are not version-controlled):
+#   lefthook install
+#
+# TOOLS (all from MacPorts):
+#   sudo port install lefthook ruff shellcheck shfmt gitleaks
+# ---------------------------------------------------------------------------
+
+pre-commit:
+  parallel: true
+  commands:
+
+    # Secret scanning. FAIL-CLOSED, including when gitleaks is absent.
+    #
+    # This diverges deliberately from the MacPorts workspace's fail-open rule.
+    # `origin` here is a PUBLIC GitHub repo, and on 2026-08-30 an untracked file
+    # in this working tree was found to contain a live GitHub PAT (gitleaks rule
+    # `github-pat`, verified). One `git add .` would have published it. A gate
+    # that silently skips when its tool is missing is not protection for a repo
+    # in that position.
+    gitleaks:
+      run: |
+        if ! command -v gitleaks >/dev/null 2>&1; then
+          echo "✘ gitleaks not found — install it: sudo port install gitleaks"
+          echo "  This gate is fail-closed: origin is a public repository."
+          exit 1
+        fi
+        gitleaks protect --staged --redact --verbose || {
+          echo ""
+          echo "⚠️  gitleaks found a secret in staged changes. Commit blocked."
+          echo "    Do NOT bypass with --no-verify: this repo pushes to a public remote."
+          exit 1
+        }
+        echo "✓ gitleaks: no secrets in staged changes"
+
+    # Python lint. Discovery is the trap here, not the rules: four of the five
+    # Python files have no .py extension, and ruff globs *.py/*.pyi by default,
+    # so a bare `ruff check .` lints one file in five and exits 0. pyproject.toml
+    # sets extend-include to cover them.
+    #
+    # The assertion below fails if that discovery ever regresses — a green lint
+    # over one file is worse than no lint, because it reads as a pass.
+    ruff:
+      run: |
+        expected=5
+        found=$(ruff check --show-files . 2>/dev/null | grep -cE '\.py$|/mp-|^mp-|checksums2crate')
+        if [ "$found" -lt "$expected" ]; then
+          echo "✘ ruff is only discovering ${found} Python files, expected ${expected}."
+          echo "  Check [tool.ruff] extend-include in pyproject.toml."
+          exit 1
+        fi
+        ruff check .
+
+    # Shell lint. Discovery is a trap here too: `shfmt -f .` misses
+    # mp-check-upstream-mentions, whose shebang is #!/opt/local/bin/bash, so the
+    # file list is built from shebangs directly. shellcheck reads that shebang
+    # correctly once the file is named.
+    shellcheck:
+      run: |
+        files=$(for f in $(git ls-files); do
+          [ -f "$f" ] && head -1 "$f" 2>/dev/null | grep -qE '^#!.*/(ba|k|z|a)?sh( |$)' && echo "$f"
+        done)
+        [ -n "$files" ] || { echo "✘ no shell scripts discovered — check the shebang matcher"; exit 1; }
+        echo "$files" | xargs shellcheck -S warning
+
+    # Shell formatting, check-only (-d prints a diff and exits non-zero).
+    # Same shebang-based discovery as shellcheck, for the same reason.
+    shfmt:
+      run: |
+        files=$(for f in $(git ls-files); do
+          [ -f "$f" ] && head -1 "$f" 2>/dev/null | grep -qE '^#!.*/(ba|k|z|a)?sh( |$)' && echo "$f"
+        done)
+        [ -n "$files" ] || { echo "✘ no shell scripts discovered — check the shebang matcher"; exit 1; }
+        echo "$files" | xargs shfmt -d
