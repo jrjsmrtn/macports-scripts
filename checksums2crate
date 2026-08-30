@@ -3,6 +3,7 @@
 """Parse crago.crates from a Portfile."""
 
 import re
+import sys
 from typing import ClassVar
 
 # from pprint import pprint as print
@@ -522,6 +523,58 @@ class ChecksumsVisitor(NodeVisitor):
         return visited_children or node
 
 
+
+class CratesVisitor(NodeVisitor):
+    """Turn a parsed cargo.crates block into {name: {version, sha256}}."""
+
+    def visit_crates(self, node, visited_children):
+        """Return the overall output."""
+        merged: dict = {}
+        for entry in visited_children[-1]:
+            merged.update(entry)
+        return merged
+
+    def visit_cchecksum(self, node, visited_children):
+        cname, _, cversion, _, checksum, *_ = visited_children
+        return {cname: {"version": cversion, "sha256": checksum}}
+
+    def visit_cname(self, node, visisted_children):
+        return node.text
+
+    def visit_cversion(self, node, visisted_children):
+        return node.text
+
+    def visit_checksum(self, node, visisted_children):
+        return node.text
+
+    def generic_visit(self, node, visited_children):
+        """Visit node."""
+        return visited_children or node
+
+
+# In a cargo.crates block the version is right-aligned so the checksums line up.
+# Measured from the CRATES sample above: the version ends at column 42.
+CRATES_VERSION_COLUMN: int = 42
+
+
+def sha256_of(props: dict) -> str:
+    """Return a crate's sha256, which is the checksum cargo.crates records."""
+    for checksum in props["checksums"]:
+        if "sha256" in checksum:
+            return checksum["sha256"]
+    raise ValueError(f"{props['name']}: no sha256 among {props['checksums']}")
+
+
+def format_crates(crates: dict) -> str:
+    """Render grouped crate entries as a cargo.crates block."""
+    entries = []
+    for props in sorted(crates.values(), key=lambda p: p["name"]):
+        prefix = f"    {props['name']}"
+        width = CRATES_VERSION_COLUMN - len(props["version"])
+        entries.append(f"{prefix:<{width}}{props['version']}  {sha256_of(props)}")
+    return "cargo.crates \\\n" + " \\\n".join(entries)
+
+
 CRATENAME_RE: re.Pattern = re.compile(
     r"^(?P<name>.+?)-(?P<version>\d+\.\d+\.\d+[^\.]*)\.crate$"
 )
@@ -546,12 +599,27 @@ class GroupedChecksumsVisitor(ChecksumsVisitor):
 
 
 if __name__ == "__main__":
-    tree = grammar.parse(NEW)
+    grouped = GroupedChecksumsVisitor().visit(grammar.parse(NEW))
 
-    # cv = ChecksumsVisitor()
-    # files = cv.visit(tree)
-    # print(files)
+    block = format_crates(grouped["crates"])
 
-    gcv = GroupedChecksumsVisitor()
-    updated = gcv.visit(tree)
-    print(dump(updated))
+    # Round-trip through crates_grammar: the block we emit must parse, and must
+    # parse back to the crates we started from. A formatter that is checked only
+    # by eye is a claim, not a conversion.
+    expected = {
+        props["name"]: {"version": props["version"], "sha256": sha256_of(props)}
+        for props in grouped["crates"].values()
+    }
+    reparsed = CratesVisitor().visit(crates_grammar.parse(block))
+    if reparsed != expected:
+        missing = set(expected) - set(reparsed)
+        differing = {k for k in expected.keys() & reparsed.keys() if expected[k] != reparsed[k]}
+        raise SystemExit(
+            f"round-trip failed: {len(missing)} crate(s) lost, {len(differing)} altered"
+        )
+
+    print(block)
+    # Whatever was not a crate stays in the checksums block; report it separately
+    # so stdout carries only the cargo.crates text.
+    if grouped["files"]:
+        print(dump({"checksums (not crates)": grouped["files"]}), file=sys.stderr)
