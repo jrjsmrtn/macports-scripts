@@ -34,11 +34,11 @@ from itertools import chain
 from pathlib import Path
 from typing import Any, ClassVar
 
-import pandas as pd
-from github import Github
-from multidict import MultiDict
-from sh import port
-from yarl import URL
+import pandas as pd  # type: ignore[import]
+from github import Github  # type: ignore[import]
+from multidict import MultiDict  # type: ignore[import]
+from sh import port  # type: ignore[import]
+from yarl import URL  # type: ignore[import]
 
 ConfigParserDefaultsType = dict[str, str] | None
 DictConfigType = dict[str, Any]
@@ -68,14 +68,12 @@ LOGGING_CONFIG: DictConfigType = {
     "loggers": {__name__: {"handlers": ["console"]}},
 }
 
-logging.config.dictConfig(LOGGING_CONFIG)
 log = logging.getLogger(__name__)
-
 port = port.bake("-q")
 
 
 class Monitor(ABC):
-    """An abstract base class for MacPorts monitors"""
+    """An abstract base class for MacPorts monitors."""
 
     def __init__(self, options: configparser.SectionProxy) -> None:
         log.debug("%s: options are %s", self, dict(options))
@@ -124,6 +122,7 @@ class Lint(Monitor):
     """Lint maintainer's ports."""
 
     EXCLUDE_SUBPORTS: ClassVar[bool] = True
+    NOTOK_RE = re.compile(r"^(?!OK:\s+).+$", re.MULTILINE)
 
     def __init__(self, options: configparser.SectionProxy) -> None:
         super().__init__(options)
@@ -143,13 +142,12 @@ class Lint(Monitor):
             log.debug("%s: excluding subports %s", self, subports)
             ports = ports - subports
 
-        NOTOK_RE = re.compile(r"^(?!OK:\s+).+$", re.MULTILINE)
         for p in sorted(ports):
             lint = port.bake("-v").lint(p).stdout.decode(sys.stdin.encoding)
             if log.isEnabledFor(logging.INFO):
                 log.info(lint)
             else:
-                notok = NOTOK_RE.findall(lint)
+                notok = self.NOTOK_RE.findall(lint)
                 if notok:
                     log.warning("\n".join(notok))
 
@@ -158,6 +156,7 @@ class Livecheck(Monitor):
     """Livecheck maintainer's ports."""
 
     EXCLUDE_SUBPORTS: ClassVar[bool] = True
+    UPDATED_RE = re.compile(r"^.+seems to have been updated.+$", re.MULTILINE)
 
     def __init__(self, options: configparser.SectionProxy) -> None:
         super().__init__(options)
@@ -182,8 +181,7 @@ class Livecheck(Monitor):
         if log.isEnabledFor(logging.INFO):
             log.info(livechecks)
         else:
-            UPDATED_RE = re.compile(r"^.+seems to have been updated.+$", re.MULTILINE)
-            updated = UPDATED_RE.findall(livechecks)
+            updated = self.UPDATED_RE.findall(livechecks)
             if updated:
                 for update in updated:
                     log.warning(update)
@@ -296,7 +294,7 @@ class Tickets(Monitor):
             log.info("Found no relevant Trac tickets.")
 
 
-def parse_args() -> argparse.Namespace:
+def make_argparser() -> argparse.ArgumentParser:
     """Parse CLI arguments."""
     parser = argparse.ArgumentParser(
         description="Check MacPorts port maintainer information."
@@ -325,47 +323,60 @@ def parse_args() -> argparse.Namespace:
         dest="loglevel",
         const=logging.DEBUG,
     )
-    return parser.parse_args()
+    return parser
 
 
-def parse_config(
-    filenames: FilenamesType, defaults: ConfigParserDefaultsType = None
+def make_configparser(
+    defaults: ConfigParserDefaultsType = None,
 ) -> configparser.ConfigParser:
     """Parse config files."""
 
     def getlist(option: str, sep: str = ",", chars: str | None = None) -> list[str]:
-        """Return a list from a ConfigParser option. By default,
-        split on a comma and strip whitespaces."""
+        """Return a list from a ConfigParser option.
+
+        By default, split on a comma and strip whitespaces.
+        """
         # return [chunk.strip(chars) for chunk in option.split(sep)]
         values = [chunk.strip(chars) for chunk in re.compile(sep).split(option)]
         return [v for v in values if v]
 
     def getset(option: str, sep: str = ",", chars: str | None = None) -> set[str]:
-        """Return a set from a ConfigParser option. By default,
-        split on a comma and strip whitespaces."""
+        """Return a set from a ConfigParser option.
+
+        By default, split on a comma and strip whitespaces.
+        """
         return set(getlist(option, sep, chars))
 
     def optionxform(option: str) -> str:
-        """Convert a ConfigParser option name to lowercase and replace dashes
-        with underscores."""
+        """Convert a ConfigParser option.
+
+        Lowercase name and replace dashes with underscores.
+        """
         return option.lower().replace("-", "_")
 
-    config = configparser.ConfigParser(
+    parser = configparser.ConfigParser(
         converters={"list": partial(getset, sep=r"[,\s\n]+")}, defaults=defaults
     )
-    config.optionxform = optionxform  # type: ignore
+    parser.optionxform = optionxform  # type: ignore
 
-    config.read(filenames)
-    return config
+    return parser
 
 
-def main():
-    args = parse_args()
-    log.setLevel(args.loglevel or logging.WARN)
+def setup_logging(loglevel: int = logging.WARN) -> None:
+    """Configure logging."""
+    logging.config.dictConfig(LOGGING_CONFIG)
+    log = logging.getLogger(__name__)
+    log.setLevel(loglevel)
+
+
+def main() -> None:
+    """Script entry point."""
+    args = make_argparser().parse_args()
+    setup_logging(args.loglevel)
     log.debug("args are %s", args)
-
     log.debug("reading config from %s", CONFIG_FILENAMES)
-    config = parse_config(CONFIG_FILENAMES)
+    config = make_configparser()
+    config.read(CONFIG_FILENAMES)
 
     monitors = args.monitors if args.monitors else Monitor.monitors()
 
