@@ -477,6 +477,14 @@ crates_grammar = Grammar(
     r"""
     crates = 'cargo.crates' _ cchecksum+
     cchecksum = cname _ cversion _ checksum _
+    cname = ~r'[\w\.\+-]+'
+    cversion = ~r'[\w\.\+-]+'
+    checksum = ~r'[0-9A-Za-z]+'
+
+    _ = meaninglessness*
+    meaninglessness = ~r"\s+" / comment / continuation
+    comment = ~r"#[^\r\n]*"
+    continuation = ~r'\\\n'
     """
 )
 
