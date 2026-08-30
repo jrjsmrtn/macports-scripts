@@ -1,0 +1,16 @@
+#!/bin/bash
+# myports_bin_dir is set by `eval $(myports-config)` below; shellcheck
+# cannot follow eval, so the reference looks unassigned to it.
+# shellcheck disable=SC2154
+set -e
+eval "$("$(dirname "$0")"/myports-config)"
+
+cmd="$1"
+
+if [[ -z "$cmd" ]]; then
+	(cd "${myports_bin_dir}" &&
+		find . -name '_myports_cmp_*') |
+		cut -c 16-
+else
+	"${myports_bin_dir}/_myports_cmp_${cmd}" "${@:2}"
+fi

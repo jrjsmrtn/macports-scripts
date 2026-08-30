@@ -1,0 +1,17 @@
+#!/usr/bin/env gawk -f 
+BEGIN {
+    FS="\t";
+}
+NR==1 { 
+    for (h=2;h<=NF;h++) {
+        version[h]=$h
+    };
+}; 
+NR>1 && /\t *\+/ {
+    port=$1; 
+    for (f=2;f<=NF;f++) { 
+        if ($f ~ /^[^\*]$/) {
+            print version[f] "-" port
+        };
+    }; 
+};

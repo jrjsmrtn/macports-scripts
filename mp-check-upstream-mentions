@@ -1,0 +1,16 @@
+#!/opt/local/bin/bash
+
+declare -r installed
+installed="$(port installed | awk '{ print $1; }' | tail -n+2)"
+
+for portname in ${installed}; do
+	echo "--->  Checking upstream ${portname}"
+
+	declare -a gh=()
+	read -ra gh < <(port cat "${portname}" | awk '/^github.setup/ { print $2, $3, $4, $5; }')
+	[[ ${#gh[@]} -eq 0 ]] && echo "GitHub setup: ${gh[*]}"
+
+	homepage="$(port info --homepage | awk '{ print $2; }')"
+	[[ -z "${homepage}" ]] && echo "Homepage: ${homepage}"
+
+done

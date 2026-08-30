@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+
+"""Show a summary of macports-ports commits."""
+
+# FIXME breaks if neither --days or --since are given
+# TODO move configuration to configargparse ?
+# TODO omit "update to XXX" commits
+
+import argparse
+import fnmatch
+import logging
+import logging.config
+import os
+import re
+import subprocess
+from collections import defaultdict
+from collections.abc import Callable
+from datetime import datetime, timedelta
+from functools import partial
+from importlib import import_module
+from operator import itemgetter
+from typing import Any
+
+import argcomplete  # type: ignore[import]
+from github import Commit, Github  # type: ignore[import]
+from rich.console import Console  # type: ignore[import]
+from rich.progress import Progress  # type: ignore[import]
+from rich.table import Table  # type: ignore[import]
+from sh import port  # type: ignore[import]
+
+TCommit = Commit.Commit
+DictConfig = dict[str, Any]
+Renderers = dict[
+    str, tuple[str, str, list | None, dict | None, Callable | None]
+]
+TPattern = str | re.Pattern
+TPatterns = list[str] | set[str]
+
+GITHUB_REPO: str = "macports/macports-ports"
+
+
+
+def _github_token() -> str:
+    """Resolve a GitHub token without storing one in this file.
+
+    Prefers $GITHUB_TOKEN so CI can inject one; otherwise asks the gh CLI, which
+    keeps its token in the macOS keyring. Nothing is written to disk here.
+    """
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        return token
+    try:
+        completed = subprocess.run(
+            ["gh", "auth", "token"], capture_output=True, text=True, check=True
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise SystemExit(
+            "no GitHub token available: set GITHUB_TOKEN or run `gh auth login`"
+        ) from exc
+    token = completed.stdout.strip()
+    if not token:
+        raise SystemExit("gh auth token returned nothing; run `gh auth login`")
+    return token
+
+
+def table_dumper(table: Table, found: dict[str, list[str]]) -> Table:
+    """Dump a rich Table."""
+    for portname, summaries in found.items():
+        table.add_row(portname, summaries)
+    return table
+
+
+RENDERERS: Renderers = {
+    # fmt: (modname, fname, args, kwargs, dumper)
+    "yaml": ("yaml", "dump", None, None, None),
+    "json": ("json", "dumps", None, None, None),
+    "pprint": ("pprint", "pformat", None, None, None),
+    "table": ("rich.table", "Table", ["ports", "summary"], None, None),
+}
+DEFAULT_RENDERER: str = "yaml"
+DEFAULT_DAYS: int = 7
+
+MSG_RE: re.Pattern = re.compile(r"""(?msx)
+    ^
+    (?P<portname>[^:\n]+?):\s*
+        (?P<summary>[^\n]+)
+        (?:\n+(?P<description>.+)
+    )?
+    $
+    """)
+PORTNAME_RE: re.Pattern = re.compile(r"^[a-zA-Z][a-zA-Z0-9_\-\.]*$")
+PORT_UPDATE_RE: re.Pattern = re.compile(r"(?i)^updates?\s+to\s+(v|version\s+)?[^\s]*$")
+NEW_PORT_RE: re.Pattern = re.compile(r"(?i)\bnew\s+port\b")
+
+LOGGING_CONFIG: DictConfig = {
+    "version": 1,
+    "formatters": {
+        "brief": {"format": "[%(levelname)s] %(message)s"},
+    },
+    "handlers": {
+        "stderr": {
+            "class": "logging.StreamHandler",
+            "formatter": "brief",
+            "stream": "ext://sys.stderr",
+        },
+        "rich": {
+            "class": "rich.logging.RichHandler",
+            "console": Console(stderr=True),
+        },
+    },
+    "loggers": {__name__: {"handlers": ["rich"]}},
+}
+
+log = logging.getLogger(__name__)
+port = port.bake("-q")
+
+
+def all_portnames() -> list[str]:
+    """Get the name of all ports."""
+    return sorted([p.split()[0] for p in port.list()])
+
+
+def is_portname(s: str) -> bool:
+    """Check for a portname."""
+    return bool(PORTNAME_RE.match(s))
+
+
+def make_renderer(fmt: str) -> Callable:
+    """Make a Dumper based on --format CLI option."""
+    modname, fname, args, kwargs, dumper = RENDERERS[fmt]
+    if type(modname) is str:
+        renderer = getattr(import_module(modname), fname)
+    if args or kwargs:
+        args = args if args else []
+        kwargs = kwargs if kwargs else {}
+        renderer = partial(renderer, *args, **kwargs)
+    return renderer  # FIXME
+
+
+def make_portname_filter(patterns: TPatterns, as_regex: bool = False) -> Callable:
+    """Make a port filter."""
+    patterns = set(patterns)
+    only_one: bool = len(patterns) == 1
+    all_portnames: bool = all(is_portname(p) for p in patterns)
+    # print([is_portname(p) for p in patterns], file=sys.stderr)
+
+    pattern: TPattern
+
+    if all_portnames:
+        if only_one:
+            # we have only one literal port name
+            pattern = patterns.pop()
+            log.debug("Using equality filter: %s", pattern)
+            return lambda s: s == pattern
+
+        # we have a set of literal port names
+        log.debug("Using Set filter: %s", patterns)
+        return lambda s: s in patterns
+
+    if as_regex:
+        # we have one or more port name regexes
+        pattern = re.compile("|".join(patterns))
+        log.debug("Using Regex filter: %s", pattern)
+        return pattern.match
+
+    if only_one:
+        # we have only one port name glob
+        pattern = patterns.pop()
+        log.debug("Using fnmatch filter: %s", pattern)
+        return lambda s: fnmatch.fnmatch(s, pattern)
+
+    # we have multiple port name globs (that we translate to a regex)
+    pattern = re.compile("|".join(fnmatch.translate(p) for p in patterns))
+    log.debug("Using translated fnmatch filter: %s", pattern)
+    return pattern.match
+
+
+def make_argparser() -> argparse.ArgumentParser:
+    """Make a ArgumentParser."""
+    parser = argparse.ArgumentParser(
+        description="Show a summary of MacPorts ports commits."
+    )
+
+    parser.add_argument(
+        "port", nargs="*", type=str, help="The port names to search for"
+    ).completer = all_portnames  # type: ignore[attr-defined]
+
+    parser.add_argument("--regex", action="store_true", help="Port names are regexes")
+
+    summary = parser.add_mutually_exclusive_group()
+    summary.add_argument(
+        "--omit-updates", action="store_true", help="omit 'update to *' commits"
+    )
+    summary.add_argument(
+        "--only-new", action="store_true", help="show 'new port' commits only"
+    )
+
+    parser.add_argument(
+        "--format",
+        "-f",
+        action="store",
+        choices=RENDERERS.keys(),
+        default=DEFAULT_RENDERER,
+        help=f"the output format (default: {DEFAULT_RENDERER})",
+    )
+
+    verbosity = parser.add_mutually_exclusive_group()
+    verbosity.add_argument(
+        "-v",
+        "--verbose",
+        action="store_const",
+        dest="loglevel",
+        const=logging.INFO,
+        default=logging.WARN,
+    )
+    verbosity.add_argument(
+        "-d",
+        "--debug",
+        action="store_const",
+        dest="loglevel",
+        const=logging.DEBUG,
+    )
+    verbosity.add_argument(
+        "-q",
+        "--quiet",
+        action="store_const",
+        dest="loglevel",
+        const=logging.ERROR,
+    )
+
+    since = parser.add_mutually_exclusive_group()
+    since.add_argument(
+        "--since",
+        action="store",
+        dest="since",
+        type=datetime.fromisoformat,
+        metavar="DATE",
+        help="the date to summarize from",
+    )
+    since.add_argument(
+        "--days",
+        action="store",
+        dest="since",
+        type=lambda d: datetime.today() - timedelta(int(d)),
+        metavar="DAYS",
+        default=DEFAULT_DAYS,
+        help=f"the number of days to summarize (default: {DEFAULT_DAYS})",
+    )
+
+    return parser
+
+
+def setup_logging(loglevel: int) -> None:
+    """Configure logging."""
+    logging.config.dictConfig(LOGGING_CONFIG)
+    log = logging.getLogger(__name__)
+    log.setLevel(loglevel)
+
+
+def main() -> None:
+    """Script entry point."""
+    parser = make_argparser()
+    argcomplete.autocomplete(parser)  # FIXME
+    args = parser.parse_args()
+
+    setup_logging(args.loglevel)
+    log.debug("args are: %s", args)
+
+    fetched = parsed = 0
+
+    log.info("Connecting to repo: %s", GITHUB_REPO)
+    repo = Github(_github_token()).get_repo(GITHUB_REPO)
+
+    log.info("Getting commits since: %s", args.since)
+    commits = repo.get_commits(since=args.since)
+
+    found = defaultdict(list)
+    filters = []
+
+    if args.port:
+        getter = itemgetter("portname")
+        filter = make_portname_filter(args.port, as_regex=args.regex)  # noqa: A001
+        filters.append((getter, filter))
+
+    if args.omit_updates:
+        getter = itemgetter("summary")
+        filter = lambda s: not PORT_UPDATE_RE.match(s)  # noqa: A001, E731
+        filters.append((getter, filter))
+
+    if args.only_new:
+        getter = itemgetter("summary")
+        filter = lambda s: NEW_PORT_RE.match(s)  # noqa: A001, E731
+        filters.append((getter, filter))
+
+    if filters:
+        log.debug("filters are:\n%s", filters)
+
+        def filter_commit(commit: Commit) -> bool:
+            return all(
+                filter(getter(commit))
+                for getter, filter in filters  # noqa: A001
+            )
+
+    else:
+
+        def filter_commit(commit: Commit) -> bool:
+            return True
+
+    def append_commit(commit: Commit) -> None:
+        """Append a matching commit to found."""
+        found[commit["portname"]].append(commit["summary"])
+
+    with Progress(transient=True) as progress:
+        task_id = progress.add_task("Fetching commits", start=False, total=None)
+
+        for commit in commits:
+            fetched += 1
+            message = commit.commit.message
+            if match := MSG_RE.match(message):
+                parsed += 1
+                c = dict(commit=commit, message=message, **match.groupdict())
+                progress.update(
+                    task_id, description=f"Fetching commit on {c['portname']}"
+                )
+                if filter_commit(c):
+                    append_commit(c)
+            else:
+                log.warning("Cannot parse commit message:\n%s", message)
+
+    log.info(
+        "Fetched %i, parsed %i, found %i matching commits.", fetched, parsed, len(found)
+    )
+    if found:
+        dumper = make_renderer(args.format)
+        print(dumper(dict(found)))
+
+
+if __name__ == "__main__":
+    main()

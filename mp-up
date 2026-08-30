@@ -1,0 +1,155 @@
+#!/bin/bash
+#
+# mp-up -- bring the MacPorts installation up to date, one confirmed step at a
+# time.
+#
+#   1. sync the ports tree            (always, needs sudo)
+#   2. show what is outdated,         then ask before `port -p upgrade outdated`
+#   3. show what is left inactive,    then ask before `port uninstall inactive`
+#
+# Answering "no" to a step skips only that step; the run continues. Steps whose
+# list is empty are reported and skipped without asking.
+#
+# Requires: gum (port install gum)
+
+set -euo pipefail
+
+progname=$(basename "$0")
+
+usage() {
+	cat <<EOF
+usage: ${progname} [-y] [-h]
+
+Sync the ports tree, then offer to upgrade outdated ports and uninstall
+inactive ones.
+
+  -y, --yes    assume "yes" for every prompt (still shows each list)
+  -h, --help   show this help
+EOF
+}
+
+assume_yes=no
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	-y | --yes)
+		assume_yes=yes
+		shift
+		;;
+	-h | --help)
+		usage
+		exit 0
+		;;
+	*)
+		printf '%s: unknown option: %s\n' "${progname}" "$1" >&2
+		usage >&2
+		exit 2
+		;;
+	esac
+done
+
+for tool in port gum; do
+	if ! command -v "${tool}" >/dev/null 2>&1; then
+		printf '%s: %s not found in PATH\n' "${progname}" "${tool}" >&2
+		exit 1
+	fi
+done
+
+# --- presentation helpers ----------------------------------------------------
+
+# `--` guards against a message that starts with a dash being read as a flag.
+heading() {
+	gum style --border rounded --border-foreground 212 --padding '0 1' -- "$1"
+}
+
+note() {
+	gum style --foreground 245 -- "$1"
+}
+
+# Ask a yes/no question. 0 = yes, 1 = no; anything else from gum (Esc, ^C) is an
+# abort of the whole run, not a "no".
+confirm() {
+	local rc=0
+
+	if [[ "${assume_yes}" == yes ]]; then
+		note "--yes: $1"
+		return 0
+	fi
+
+	gum confirm -- "$1" || rc=$?
+	case "${rc}" in
+	0) return 0 ;;
+	1) return 1 ;;
+	*)
+		printf '%s: aborted\n' "${progname}" >&2
+		exit 130
+		;;
+	esac
+}
+
+# --- 1. sync ----------------------------------------------------------------
+
+heading 'MacPorts update'
+
+# Prime the sudo credentials once, up front, so no later prompt lands in the
+# middle of a list or a progress bar.
+sudo -v
+
+heading 'Syncing the ports tree'
+sudo port sync
+
+# --- 2. upgrade outdated ----------------------------------------------------
+
+heading 'Outdated ports'
+
+outdated=$(port -q outdated)
+
+if [[ -z "${outdated}" ]]; then
+	note 'No installed ports are outdated.'
+else
+	# `port outdated` prints: name  installed < latest [ (reason) ] [!]
+	printf '%s\n' "${outdated}" |
+		awk '{
+            note = ""
+            for (i = 5; i <= NF; i++)
+                note = note (note == "" ? "" : " ") $i
+            gsub(/\|/, "/", note)
+            printf "%s|%s|%s|%s\n", $1, $2, $4, note
+        }' |
+		gum table --print --separator '|' --columns 'Port,Installed,Latest,Note'
+
+	count=$(printf '%s\n' "${outdated}" | wc -l | tr -d ' ')
+
+	if confirm "Upgrade ${count} outdated port(s)?"; then
+		sudo port -p upgrade outdated
+	else
+		note 'Skipped the upgrade.'
+	fi
+fi
+
+# --- 3. uninstall inactive --------------------------------------------------
+
+heading 'Inactive ports'
+
+# Recomputed after the upgrade on purpose: upgrading is what deactivates the
+# previous versions this step is here to remove.
+inactive=$(port -q installed inactive)
+
+if [[ -z "${inactive}" ]]; then
+	note 'No inactive ports are installed.'
+else
+	# `port installed` prints: "  name @version_revision [(active)]"
+	printf '%s\n' "${inactive}" |
+		awk '{ sub(/^@/, "", $2); printf "%s|%s\n", $1, $2 }' |
+		gum table --print --separator '|' --columns 'Port,Version'
+
+	count=$(printf '%s\n' "${inactive}" | wc -l | tr -d ' ')
+
+	if confirm "Uninstall ${count} inactive port(s)?"; then
+		sudo port uninstall inactive
+	else
+		note 'Kept the inactive ports.'
+	fi
+fi
+
+heading 'Done'

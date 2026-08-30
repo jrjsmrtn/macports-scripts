@@ -1,0 +1,35 @@
+# checksums = 'checksums' _ pchecksum+
+
+start: "checksums" pchecksum+
+
+# pchecksum = fname _ fchecksum+ _ fsize _
+
+pchecksum: fname fchecksum+ fsize
+
+# fname = ~r'[\w\.\+-]+'
+
+fname: 
+    ( NAME
+    | '+'
+    | '-'
+    | '.'
+    )+
+
+# fchecksum = type _ checksum _
+
+fchecksum: type checksum
+
+# type = ('rmd160' / 'sha256')
+
+type: ('rmd160' | 'sha256')
+
+# checksum = ~'[0-9A-Za-z]+'
+
+# fsize = 'size' _ size
+
+# size = ~r'\d+'
+
+# _ = meaninglessness*
+# meaninglessness = ~r"\s+" / comment / continuation
+# comment = ~r"#[^\r\n]*"
+# continuation = ~r'\\\n'

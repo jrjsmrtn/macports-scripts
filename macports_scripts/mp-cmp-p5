@@ -1,0 +1,25 @@
+#!/usr/bin/env gawk -f
+BEGIN {
+    $OFS="\t"
+}
+
+$1~/^p5(\.[0-9]+)?-/ {
+    split($1, name, "-")
+    ports[name[2]][name[1]]="*"
+    versions[name[1]]++
+}
+
+END {
+    for(version in versions) {
+        header=header"\t"version
+    }
+    print header
+
+    for(port in ports){
+        line=port
+        for(version in versions){
+            line=line"\t"ports[port][version]
+        };
+        print line
+    }
+}

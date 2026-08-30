@@ -1,0 +1,10 @@
+#!/bin/bash
+
+# List the installed ports that could be reinstalled with +universal variant
+
+port installed |
+	grep active | grep -v universal |
+	awk '{print $1" "$2}' |
+	while read -r p v; do
+		[[ $(port variants "$p") =~ universal ]] && echo "$p $v"
+	done
