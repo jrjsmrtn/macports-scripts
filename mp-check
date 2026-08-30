@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
-"""
-A quick-and-dirty MacPorts check tool for port maintainers.
+"""A quick-and-dirty MacPorts check tool for port maintainers.
 
 Checks are:
 
@@ -31,37 +30,30 @@ import logging.config
 import re
 import sys
 from abc import ABC, abstractmethod
+from collections.abc import Iterable, Sequence
 from functools import partial
 from itertools import chain
 from pathlib import Path
-from typing import (
-    Any,
-    ClassVar,
-    Dict,
-    Iterable,
-    List,
-    Optional,
-    Sequence,
-    Set,
-    Union,
-)
+from typing import Any, ClassVar
 
-import pandas as pd
-from github import Github
-from multidict import MultiDict
-from sh import port
-from yarl import URL
+import pandas as pd  # type: ignore[import]
+from github import Github  # type: ignore[import]
+from multidict import MultiDict  # type: ignore[import]
+from sh import port  # type: ignore[import]
+from yarl import URL  # type: ignore[import]
 
-ConfigParserDefaultsType = Optional[Dict[str, str]]
-DictConfigType = Dict[str, Any]
-FilenameType = Union[str, Path]
+ConfigParserDefaultsType = dict[str, str] | None
+DictConfigType = dict[str, Any]
+FilenameType = str | Path
 FilenamesType = Sequence[FilenameType]
 
-CHECKS = ("Livecheck", "Tickets", "PullRequests", "Lint")
-CONFIG_FILENAMES: FilenamesType = [Path(p).expanduser() for p in (
-    "mp-check.conf",
-    "~/.macports/mp-check.conf",
-)]
+CONFIG_FILENAMES: FilenamesType = [
+    Path(p).expanduser()
+    for p in (
+        "mp-check.conf",
+        "~/.macports/mp-check.conf",
+    )
+]
 LOGGING_CONFIG: DictConfigType = {
     "version": 1,
     "formatters": {
@@ -78,110 +70,42 @@ LOGGING_CONFIG: DictConfigType = {
     "loggers": {__name__: {"handlers": ["console"]}},
 }
 
-logging.config.dictConfig(LOGGING_CONFIG)
 log = logging.getLogger(__name__)
-
 port = port.bake("-q")
 
 
-def parse_args() -> argparse.Namespace:
-    """Parse CLI arguments."""
-    parser = argparse.ArgumentParser(
-        description="Check MacPorts port maintainer information."
-    )
-    check_group = parser.add_argument_group("checks")
-    for check in CHECKS:
-        check_group.add_argument(
-            "--" + check.lower(),
-            action="append_const",
-            dest="checks",
-            const=check,
-        )
-    verbosity = parser.add_mutually_exclusive_group()
-    verbosity.add_argument(
-        "-v",
-        "--verbose",
-        action="store_const",
-        dest="loglevel",
-        const=logging.INFO,
-        default=logging.WARN,
-    )
-    verbosity.add_argument(
-        "-d",
-        "--debug",
-        action="store_const",
-        dest="loglevel",
-        const=logging.DEBUG,
-    )
-    return parser.parse_args()
-
-
-def parse_config(
-    filenames: FilenamesType, defaults: ConfigParserDefaultsType = None
-) -> configparser.ConfigParser:
-    """Parse config files."""
-
-    def getlist(
-        option: str, sep: Optional[str] = ",", chars: Optional[str] = None
-    ) -> List[str]:
-        """Return a list from a ConfigParser option. By default,
-           split on a comma and strip whitespaces."""
-        # return [chunk.strip(chars) for chunk in option.split(sep)]
-        values = [chunk.strip(chars)
-                  for chunk in re.compile(sep).split(option)]
-        return [v for v in values if v]
-
-    def optionxform(option: str) -> str:
-        """Convert a ConfigParser option name to lowercase and replace dashes
-           with underscores."""
-        return option.lower().replace("-", "_")
-
-    config = configparser.ConfigParser(
-        converters={"list": partial(getlist, sep=r"[,\s\n]+")},
-        defaults=defaults
-    )
-    config.optionxform = optionxform  # type: ignore
-
-    config.read(filenames)
-    return config
-
-
-class _Base(ABC):
-    """An abstract base class for MacPorts checks"""
+class Monitor(ABC):
+    """An abstract base class for MacPorts monitors."""
 
     def __init__(self, options: configparser.SectionProxy) -> None:
         log.debug("%s: options are %s", self, dict(options))
         self.options = options
         self.maintainer: str = options.get("maintainer")
-        self.include_ports: Set[str] = set(
-            options.getlist("include_ports", [])
-        )
-        self.exclude_ports: Set[str] = set(
-            options.getlist("exclude_ports", [])
-        )
+        self.include_ports: set[str] = set(options.getlist("include_ports", []))
+        self.exclude_ports: set[str] = set(options.getlist("exclude_ports", []))
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.__class__.__name__
 
-    def port_filters(self) -> List[str]:
+    @classmethod
+    def monitors(cls):
+        return cls.__subclasses__()
+
+    def port_filters(self) -> list[str]:
         """Make a list of port filters."""
-        exclude_ports = "".join(
-            f" and not name:{p}" for p in self.exclude_ports
-        )
+        exclude_ports = "".join(f" and not name:{p}" for p in self.exclude_ports)
         filters = [f"maintainer:{self.maintainer}{exclude_ports}"]
         filters.extend(f"name:{p}" for p in self.include_ports)
         return filters
 
-    def ports(self, filters: Iterable[str]) -> Set[str]:
+    def ports(self, filters: Iterable[str]) -> set[str]:
         """List the ports matching the given filters."""
         ports = set(
-            chain.from_iterable(
-                port.echo(f).split() for f in self.port_filters()
-            )
+            chain.from_iterable(port.echo(f).split() for f in self.port_filters())
         )
         return ports
 
-    def subports(self, ports: Iterable[str]) -> Set[str]:
+    def subports(self, ports: Iterable[str]) -> set[str]:
         """List the subports of given ports."""
         subports = set(
             chain.from_iterable(
@@ -196,10 +120,11 @@ class _Base(ABC):
         raise NotImplementedError()
 
 
-class Lint(_Base):
+class Lint(Monitor):
     """Lint maintainer's ports."""
 
     EXCLUDE_SUBPORTS: ClassVar[bool] = True
+    NOTOK_RE = re.compile(r"^(?!OK:\s+).+$", re.MULTILINE)
 
     def __init__(self, options: configparser.SectionProxy) -> None:
         super().__init__(options)
@@ -207,7 +132,7 @@ class Lint(_Base):
             "exclude_subports", fallback=Lint.EXCLUDE_SUBPORTS
         )
 
-    def check(self) -> str:
+    def check(self) -> None:
         log.warning("---> %s", self)
         filters = self.port_filters()
         log.debug("%s: port filters are %s", self, filters)
@@ -219,21 +144,21 @@ class Lint(_Base):
             log.debug("%s: excluding subports %s", self, subports)
             ports = ports - subports
 
-        NOTOK_RE = re.compile(r"^(?!OK:\s+).+$", re.MULTILINE)
         for p in sorted(ports):
             lint = port.bake("-v").lint(p).stdout.decode(sys.stdin.encoding)
             if log.isEnabledFor(logging.INFO):
                 log.info(lint)
             else:
-                notok = NOTOK_RE.findall(lint)
+                notok = self.NOTOK_RE.findall(lint)
                 if notok:
                     log.warning("\n".join(notok))
 
 
-class Livecheck(_Base):
+class Livecheck(Monitor):
     """Livecheck maintainer's ports."""
 
     EXCLUDE_SUBPORTS: ClassVar[bool] = True
+    UPDATED_RE = re.compile(r"^.+seems to have been updated.+$", re.MULTILINE)
 
     def __init__(self, options: configparser.SectionProxy) -> None:
         super().__init__(options)
@@ -241,7 +166,7 @@ class Livecheck(_Base):
             "exclude_subports", fallback=Livecheck.EXCLUDE_SUBPORTS
         )
 
-    def check(self) -> str:
+    def check(self) -> None:
         log.warning("---> %s", self)
         filters = self.port_filters()
         log.debug("%s: port filters are %s", self, filters)
@@ -252,21 +177,19 @@ class Livecheck(_Base):
             log.debug("%s: excluding subports %s", self, subports)
             ports = ports - subports
         log.debug("%s: livechecking ports", self)
-        livechecks = port.bake("-v").livecheck(sorted(ports)).stdout.decode(
-            sys.stdin.encoding)
+        livechecks = (
+            port.bake("-v").livecheck(sorted(ports)).stdout.decode(sys.stdin.encoding)
+        )
         if log.isEnabledFor(logging.INFO):
             log.info(livechecks)
         else:
-            UPDATED_RE = re.compile(
-                r"^.+seems to have been updated.+$",
-                re.MULTILINE)
-            updated = UPDATED_RE.findall(livechecks)
+            updated = self.UPDATED_RE.findall(livechecks)
             if updated:
                 for update in updated:
                     log.warning(update)
 
 
-class PullRequests(_Base):
+class PullRequests(Monitor):
     """Check MacPorts Pull Requests."""
 
     EXCLUDE_SUBPORTS: ClassVar[bool] = True
@@ -274,12 +197,12 @@ class PullRequests(_Base):
     def __init__(self, options: configparser.SectionProxy) -> None:
         super().__init__(options)
         self.exclude_subports: bool = options.getboolean(
-            "exclude_subports", fallback=Livecheck.EXCLUDE_SUBPORTS
+            "exclude_subports", fallback=PullRequests.EXCLUDE_SUBPORTS
         )
         gh = Github()
         self.repo = gh.get_repo("macports/macports-ports")
 
-    def check(self) -> str:
+    def check(self) -> None:
         log.warning("---> %s", self)
         filters = self.port_filters()
         log.debug("%s: port filters are %s", self, filters)
@@ -289,24 +212,33 @@ class PullRequests(_Base):
             subports = self.subports(ports)
             log.debug("%s: excluding subports %s", self, subports)
             ports = ports - subports
+
         log.debug("%s: getting pull requests", self)
 
         SEP_RE = re.compile(r":\s")
         COLS = ("number", "title", "user.login", "labels")
 
         def getter(port):
-            return (port.number, port.title, port.user.login,
-                    ", ".join(label.name for label in port.get_labels()))
+            return (
+                port.number,
+                port.title,
+                port.user.login,
+                ", ".join(label.name for label in port.get_labels()),
+            )
 
-        pulls = pd.DataFrame.from_records(
-            (getter(p) for p in self.repo.get_pulls(state="open")
-             if (p.user.login == self.maintainer)
-             or (set(SEP_RE.split(p.title)[0].split()) & ports)),
-            columns=COLS, index=COLS[0])
+        recs = [
+            getter(p)
+            for p in self.repo.get_pulls(state="open")
+            if (p.user.login == self.maintainer)
+            or (set(SEP_RE.split(p.title)[0].split()) & ports)
+        ]
+        log.warning(recs)
+
+        pulls = pd.DataFrame.from_records(recs, columns=COLS, index=COLS[0])
         log.warning(pulls)
 
 
-class Tickets(_Base):
+class Tickets(Monitor):
     """Get Trac open tickets for maintainer's ports."""
 
     TRAC_QUERY_URL: ClassVar[URL] = URL("https://trac.macports.org/query")
@@ -328,7 +260,7 @@ class Tickets(_Base):
     TRAC_ORDER: ClassVar[str] = "port"
     TRAC_FORMAT: ClassVar[str] = "tab"
 
-    def trac_filters(self) -> List[Dict[str, str]]:
+    def trac_filters(self) -> list[dict[str, str]]:
         """Make a list of Trac filters."""
         filters = [{"owner": self.maintainer}]
         for p in self.include_ports:
@@ -364,20 +296,97 @@ class Tickets(_Base):
             log.info("Found no relevant Trac tickets.")
 
 
-def main():
-    args = parse_args()
-    log.setLevel(args.loglevel or logging.WARN)
+def make_argparser() -> argparse.ArgumentParser:
+    """Parse CLI arguments."""
+    parser = argparse.ArgumentParser(
+        description="Check MacPorts port maintainer information."
+    )
+    monitors_group = parser.add_argument_group("monitors")
+    for monitor in Monitor.monitors():
+        monitors_group.add_argument(
+            "--" + monitor.__name__.lower(),
+            action="append_const",
+            dest="monitors",
+            const=monitor,
+        )
+    verbosity = parser.add_mutually_exclusive_group()
+    verbosity.add_argument(
+        "-v",
+        "--verbose",
+        action="store_const",
+        dest="loglevel",
+        const=logging.INFO,
+        default=logging.WARN,
+    )
+    verbosity.add_argument(
+        "-d",
+        "--debug",
+        action="store_const",
+        dest="loglevel",
+        const=logging.DEBUG,
+    )
+    return parser
+
+
+def make_configparser(
+    defaults: ConfigParserDefaultsType = None,
+) -> configparser.ConfigParser:
+    """Parse config files."""
+
+    def getlist(option: str, sep: str = ",", chars: str | None = None) -> list[str]:
+        """Return a list from a ConfigParser option.
+
+        By default, split on a comma and strip whitespaces.
+        """
+        # return [chunk.strip(chars) for chunk in option.split(sep)]
+        values = [chunk.strip(chars) for chunk in re.compile(sep).split(option)]
+        return [v for v in values if v]
+
+    def getset(option: str, sep: str = ",", chars: str | None = None) -> set[str]:
+        """Return a set from a ConfigParser option.
+
+        By default, split on a comma and strip whitespaces.
+        """
+        return set(getlist(option, sep, chars))
+
+    def optionxform(option: str) -> str:
+        """Convert a ConfigParser option.
+
+        Lowercase name and replace dashes with underscores.
+        """
+        return option.lower().replace("-", "_")
+
+    parser = configparser.ConfigParser(
+        converters={"list": partial(getset, sep=r"[,\s\n]+")}, defaults=defaults
+    )
+    parser.optionxform = optionxform  # type: ignore
+
+    return parser
+
+
+def setup_logging(loglevel: int = logging.WARN) -> None:
+    """Configure logging."""
+    logging.config.dictConfig(LOGGING_CONFIG)
+    log = logging.getLogger(__name__)
+    log.setLevel(loglevel)
+
+
+def main() -> None:
+    """Script entry point."""
+    args = make_argparser().parse_args()
+    setup_logging(args.loglevel)
     log.debug("args are %s", args)
-
     log.debug("reading config from %s", CONFIG_FILENAMES)
-    config = parse_config(CONFIG_FILENAMES)
+    config = make_configparser().read(CONFIG_FILENAMES)
 
-    for cls in (Livecheck, Tickets, PullRequests, Lint):
-        cls(config[cls.__name__]).check()
+    monitors = args.monitors if args.monitors else Monitor.monitors()
+
+    for monitor in monitors:
+        monitor(config[monitor.__name__]).check()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
 
 
 # vim: tabstop=8 expandtab shiftwidth=4 softtabstop=4

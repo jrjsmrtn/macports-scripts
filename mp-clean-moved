@@ -1,4 +1,7 @@
 #!/bin/bash
 
 echo "---> Cleaning moved files"
-find -E /opt/local/ -regex ".*\.mp_[[:digit:]]+$" -exec echo rm \{\} \; -exec rm \{\} \;
+find -E /opt/local/ \
+	-regex ".*\.mp_[[:digit:]]+$" \
+	-exec echo rm \{\} \; \
+	-exec rm \{\} \;

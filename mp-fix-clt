@@ -1,8 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.10
 
-"""
-Fix Xcode Command Line Tools installation for MacPorts, according to:
-    https://trac.macports.org/wiki/ProblemHotlist#reinstall-clt
+"""Fix Xcode Command Line Tools installation for MacPorts.
+
+See: https://trac.macports.org/wiki/ProblemHotlist#reinstall-clt
 
 Download the command line tools package from the Apple Developer site.
 
@@ -18,65 +18,114 @@ Or, on Mac OS X 10.9 or greater, Software Update can reinstall the package:
 - `sudo rm /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress`
 """
 
+import logging
 import re
 import sys
+from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 
-from sh import softwareupdate
+from sh import softwareupdate  # type: ignore
+
+CLT_IOD_PATH: Path = Path(
+    "/tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress"  # noqa: S108
+)
+FOUND: str = "Software Update found the following new or updated software:"
+NOT_FOUND: str = "No new software available."
+RECORD_RE: re.Pattern = re.compile(r"^\*\s+(.+(?:\n\s+.+)+)$", re.MULTILINE)
+ITEM_RE: re.Pattern = re.compile(r"\s*(?P<key>\w+):\s+(?P<value>[^,\n]+)", re.MULTILINE)
+CLT_TITLE: str = "Command Line Tools for Xcode"
+
+TSoftwareUpdates = list[dict[str, str]]
+TCLTUpdates = list[str]
+
 softwareupdate = softwareupdate.bake(_err_to_out=True)
-
-
-CLT_IOD_PATH = Path("/tmp/.com.apple.dt.CommandLineTools"
-                    ".installondemand.in-progress")
-FOUND = "Software Update found the following new or updated software:"
-NOT_FOUND = "No new software available."
-RECORD_RE = re.compile(r"^\*\s+(.+(?:\n\s+.+)+)$", re.MULTILINE)
-ITEM_RE = re.compile(r"\s*(?P<key>\w+):\s+(?P<value>[^,\n]+)", re.MULTILINE)
-CLT_TITLE = "Command Line Tools for Xcode"
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 
 @contextmanager
-def clt_installondemand():
-    """Trigger the Command Line Tools for Xcode Install on Demand."""
+def clt_installondemand() -> Generator:
+    """Trigger CLT Install-on-Demand."""
+    logger.debug("Triggering the Command Line Tools for Xcode Install on Demand.")
     CLT_IOD_PATH.touch()
     try:
         yield
     finally:
+        logger.debug("Disabling the Command Line Tools for Xcode Install on Demand.")
         CLT_IOD_PATH.unlink()
 
 
-def parse_swupdate_list(sulist):
+def get_swupdates() -> str | None:
+    """Get the Software Update list."""
+    logger.info("Requesting Software Update list")
+    response = softwareupdate("--list").stdout.decode(sys.stdin.encoding)
+    logger.debug("Software Update response is: %s", response)
+    return response if FOUND in response else None
+
+
+def parse_swupdates(swupdates: str) -> TSoftwareUpdates:
     """Parse the `softwareupdate --list` result."""
-    for record in RECORD_RE.findall(sulist):
-        yield dict(ITEM_RE.findall(record))
+    return [dict(ITEM_RE.findall(record)) for record in RECORD_RE.findall(swupdates)]
 
 
-def main():
-    # Trigger CLT Install on Demand
+def get_cltupdates(swupdates: str) -> TCLTUpdates:
+    """Get CLT Updates from Software Updates list."""
+    cltupdates = [
+        swupdate["Label"]
+        for swupdate in parse_swupdates(swupdates)
+        if swupdate["Title"] == CLT_TITLE
+    ]
+    return cltupdates
+
+
+def install_clt(clt_label: str) -> str:
+    """Install the Command Line Tools."""
+    logger.info("Installing %s", clt_label)
+    result = softwareupdate("--install", clt_label).stdout.decode(sys.stdin.encoding)
+    return result
+
+
+def main() -> None:
+    """Script entry point."""
+    clt_label = sys.argv[1] if len(sys.argv) > 1 else None
+
     with clt_installondemand():
         # Check for software updates
-        result = (softwareupdate("--list")
-                  .stdout.decode(sys.stdin.encoding))
+        swupdates = get_swupdates()
+        if not swupdates:
+            logger.warn("Found no software updates")
+            sys.exit()
 
-        if FOUND in result:
-            clt_labels = list(swupdate.get("Label")
-                              for swupdate in parse_swupdate_list(result)
-                              if swupdate["Title"] == CLT_TITLE)
-            if (not clt_labels):
-                raise Exception("Found no software updates "
-                                f"for {CLT_TITLE}")
-            elif (len(clt_labels) > 1):
-                raise Exception("Found multiple software updates "
-                                f"for {CLT_TITLE}: {clt_labels}")
+        # Check for Command Line Tools updates
+        cltupdates = get_cltupdates(swupdates)
+        if not cltupdates:
+            logger.warn("Found no software updates for %s", CLT_TITLE)
+        elif len(cltupdates) > 1:
+            if clt_label:
+                logger.warning(
+                    "Found multiple software updates for %s: %s", CLT_TITLE, cltupdates
+                )
+                if clt_label in cltupdates:
+                    result = install_clt(clt_label)
+                    logger.info(result)
+                else:
+                    logger.error(
+                        '"%s" not found in available software updates for %s: %s"',
+                        clt_label,
+                        CLT_TITLE,
+                        cltupdates,
+                    )
             else:
-                # Install CLT
-                print(f"Found software update: {clt_labels[0]}.")
-                result = (softwareupdate("--install", clt_labels[0])
-                          .stdout.decode(sys.stdin.encoding))
-                print(result)
+                logger.error(
+                    "Found multiple software updates for %s: %s", CLT_TITLE, cltupdates
+                )
+
         else:
-            raise Exception(f"Found no software updates: {result}")
+            # Install CLT
+            logger.info("Found software update: %s", cltupdates[0])
+            result = install_clt(cltupdates[0])
+            logger.info(result)
 
 
 if __name__ == "__main__":
