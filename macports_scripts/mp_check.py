@@ -23,10 +23,15 @@ checks.
 
 import argparse
 import configparser
+import io
 import logging
 import logging.config
+import os
 import re
+import shutil
+import subprocess
 import sys
+import urllib.request
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Sequence
 from functools import partial
@@ -35,7 +40,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import pandas as pd  # type: ignore[import]
-from github import Github  # type: ignore[import]
+from github import Auth, Github  # type: ignore[import]
 from multidict import MultiDict  # type: ignore[import]
 from sh import port  # type: ignore[import]
 from yarl import URL  # type: ignore[import]
@@ -70,6 +75,31 @@ LOGGING_CONFIG: DictConfigType = {
 
 log = logging.getLogger(__name__)
 port = port.bake("-q")
+
+
+class MonitorError(Exception):
+    """A monitor could not produce a result that can be trusted."""
+
+
+def github_auth() -> Auth.Token | None:
+    """Authenticate to GitHub if a token is available, anonymously otherwise.
+
+    Anonymous calls are limited to 60 an hour, and one PullRequests run used
+    14 of them.
+    """
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    gh = shutil.which("gh")
+    if not token and gh:
+        # A fixed argument list, and gh resolved to an absolute path above.
+        result = subprocess.run(  # noqa: S603
+            [gh, "auth", "token"], capture_output=True, text=True, check=False
+        )
+        if result.returncode == 0:
+            token = result.stdout.strip()
+    if not token:
+        log.info("No GitHub token found; using anonymous API access.")
+        return None
+    return Auth.Token(token)
 
 
 class Monitor(ABC):
@@ -197,7 +227,8 @@ class PullRequests(Monitor):
         self.exclude_subports: bool = options.getboolean(
             "exclude_subports", fallback=PullRequests.EXCLUDE_SUBPORTS
         )
-        gh = Github()
+        # 100 per page, the API's maximum: every open pull request is listed.
+        gh = Github(auth=github_auth(), per_page=100)
         self.repo = gh.get_repo("macports/macports-ports")
 
     def check(self) -> None:
@@ -221,7 +252,8 @@ class PullRequests(Monitor):
                 port.number,
                 port.title,
                 port.user.login,
-                ", ".join(label.name for label in port.get_labels()),
+                # Already in the list response; get_labels() cost a call each.
+                ", ".join(label.name for label in port.labels),
             )
 
         recs = [
@@ -287,7 +319,21 @@ class Tickets(Monitor):
         url = Tickets.TRAC_QUERY_URL.with_query(query)
         log.debug("%s: Trac query url is %s", self, url)
         log.debug("%s: querying Trac", self)
-        tickets = pd.read_csv(str(url), delimiter="\t", index_col=0)
+        # The URL is built from the fixed https TRAC_QUERY_URL, never from input.
+        with urllib.request.urlopen(str(url)) as response:  # noqa: S310
+            content_type = response.headers.get("Content-Type", "")
+            text = response.read().decode("utf-8", errors="replace")
+        # Trac sits behind Anubis, which answers a client without JavaScript
+        # with an HTML challenge and HTTP 200. Read as TSV that was a pandas
+        # traceback about line 38; report the cause instead.
+        if content_type.startswith("text/html") or 'id="anubis_challenge"' in text:
+            browser_query = MultiDict((k, v) for k, v in query.items() if k != "format")
+            raise MonitorError(
+                "Trac answered with an Anubis bot challenge instead of tickets; "
+                "open the query in a browser: "
+                f"{Tickets.TRAC_QUERY_URL.with_query(browser_query)}"
+            )
+        tickets = pd.read_csv(io.StringIO(text), delimiter="\t", index_col=0)
         if not tickets.empty:
             log.warning(tickets)
         else:
@@ -369,7 +415,7 @@ def setup_logging(loglevel: int = logging.WARN) -> None:
     log.setLevel(loglevel)
 
 
-def main() -> None:
+def main() -> int:
     """Script entry point."""
     args = make_argparser().parse_args()
     setup_logging(args.loglevel)
@@ -380,8 +426,16 @@ def main() -> None:
 
     monitors = args.monitors if args.monitors else Monitor.monitors()
 
+    # A monitor that cannot be trusted is reported and the others still run;
+    # the exit status says whether every monitor produced a real result.
+    status = 0
     for monitor in monitors:
-        monitor(config[monitor.__name__]).check()
+        try:
+            monitor(config[monitor.__name__]).check()
+        except MonitorError as err:
+            log.error("%s: %s", monitor.__name__, err)
+            status = 1
+    return status
 
 
 if __name__ == "__main__":
